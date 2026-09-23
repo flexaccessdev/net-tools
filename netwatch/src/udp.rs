@@ -28,6 +28,57 @@ pub struct UdpSocket {
 /// UDP socket read/write buffer size (7MB). The value of 7MB is chosen as it
 /// is the max supported by a default configuration of macOS. Some platforms will silently clamp the value.
 const SOCKET_BUFFER_SIZE: usize = 7 << 20;
+
+/// Sets the receive buffer to [`SOCKET_BUFFER_SIZE`].
+///
+/// Linux silently caps `SO_RCVBUF` at `net.core.rmem_max` (about 208 KiB by
+/// default), far below the size asked for, and a UDP receive buffer that small
+/// overflows under bulk QUIC traffic. A process holding `CAP_NET_ADMIN` (a VPN
+/// running as root, say) may exceed the cap with `SO_RCVBUFFORCE`, as Tailscale
+/// does, so that is tried first. Without the capability it fails with `EPERM`
+/// and the regular, capped option applies.
+fn set_recv_buffer_size(socket: &socket2::Socket) -> io::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if set_buffer_size_force(socket, libc::SO_RCVBUFFORCE).is_ok() {
+        return Ok(());
+    }
+    socket.set_recv_buffer_size(SOCKET_BUFFER_SIZE)
+}
+
+/// Sets the send buffer to [`SOCKET_BUFFER_SIZE`], preferring
+/// `SO_SNDBUFFORCE` over the `net.core.wmem_max` cap as
+/// [`set_recv_buffer_size`] does.
+fn set_send_buffer_size(socket: &socket2::Socket) -> io::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if set_buffer_size_force(socket, libc::SO_SNDBUFFORCE).is_ok() {
+        return Ok(());
+    }
+    socket.set_send_buffer_size(SOCKET_BUFFER_SIZE)
+}
+
+/// Sets a `SO_*BUFFORCE` option to [`SOCKET_BUFFER_SIZE`].
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn set_buffer_size_force(socket: &socket2::Socket, option: libc::c_int) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let size = libc::c_int::try_from(SOCKET_BUFFER_SIZE).expect("buffer size fits in c_int");
+    // SAFETY: the fd is owned by `socket` and open for the duration of the
+    // call, and `size` is a live `c_int` whose exact length is passed.
+    let rc = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            option,
+            (&size as *const libc::c_int).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
 impl UdpSocket {
     /// Bind only Ipv4 on any interface.
     pub fn bind_v4(port: u16) -> io::Result<Self> {
@@ -769,13 +820,13 @@ impl SocketState {
             Some(socket2::Protocol::UDP),
         )?;
 
-        if let Err(err) = socket.set_recv_buffer_size(SOCKET_BUFFER_SIZE) {
+        if let Err(err) = set_recv_buffer_size(&socket) {
             debug!(
                 "failed to set recv_buffer_size to {}: {:?}",
                 SOCKET_BUFFER_SIZE, err
             );
         }
-        if let Err(err) = socket.set_send_buffer_size(SOCKET_BUFFER_SIZE) {
+        if let Err(err) = set_send_buffer_size(&socket) {
             debug!(
                 "failed to set send_buffer_size to {}: {:?}",
                 SOCKET_BUFFER_SIZE, err
@@ -1071,6 +1122,28 @@ mod tests {
     use testresult::TestResult;
 
     use super::*;
+
+    /// With `CAP_NET_ADMIN` the forced options take the buffers past the
+    /// `net.core.rmem_max` / `wmem_max` cap; without it the capped options
+    /// still apply. Run the test as root to cover the forced path.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn test_buffer_sizes_forced_past_sysctl_cap() -> TestResult {
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )?;
+        let privileged = set_buffer_size_force(&socket, libc::SO_RCVBUFFORCE).is_ok();
+        set_recv_buffer_size(&socket)?;
+        set_send_buffer_size(&socket)?;
+        if privileged {
+            // Linux reports double the requested size (bookkeeping overhead).
+            assert!(socket.recv_buffer_size()? >= SOCKET_BUFFER_SIZE);
+            assert!(socket.send_buffer_size()? >= SOCKET_BUFFER_SIZE);
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_reconnect() -> TestResult {
