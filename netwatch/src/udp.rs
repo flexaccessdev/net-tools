@@ -15,6 +15,9 @@ use tracing::{debug, trace, warn};
 
 use super::IpFamily;
 
+#[cfg(target_vendor = "apple")]
+mod peers;
+
 /// Wrapper around a tokio UDP socket.
 #[derive(Debug)]
 pub struct UdpSocket {
@@ -393,9 +396,7 @@ impl UdpSocket {
                     return Err(io::Error::new(io::ErrorKind::WouldBlock, "locked"));
                 }
             };
-            let (socket, state) = guard.try_get_connected()?;
-
-            let res = socket.try_io(Interest::WRITABLE, || state.send(socket.into(), transmit));
+            let res = guard.send_transmit(transmit);
 
             match res {
                 Ok(()) => return Ok(()),
@@ -417,7 +418,7 @@ impl UdpSocket {
             }
 
             let guard = n0_future::ready!(self.poll_read_socket(&self.send_waker, cx));
-            let (socket, state) = guard.try_get_connected()?;
+            let (socket, _state) = guard.try_get_connected()?;
 
             match socket.poll_send_ready(cx) {
                 Poll::Pending => {
@@ -425,8 +426,7 @@ impl UdpSocket {
                     return Poll::Pending;
                 }
                 Poll::Ready(Ok(())) => {
-                    let res =
-                        socket.try_io(Interest::WRITABLE, || state.send(socket.into(), transmit));
+                    let res = guard.send_transmit(transmit);
                     if let Err(err) = res {
                         if err.kind() == io::ErrorKind::WouldBlock {
                             continue;
@@ -466,6 +466,10 @@ impl UdpSocket {
 
             match socket.poll_recv_ready(cx) {
                 Poll::Pending => {
+                    #[cfg(target_vendor = "apple")]
+                    if let Poll::Ready(res) = guard.poll_recv_peers(cx, bufs, meta) {
+                        return Poll::Ready(res);
+                    }
                     self.recv_waker.register(cx.waker());
                     return Poll::Pending;
                 }
@@ -787,6 +791,10 @@ enum SocketState {
         state: noq_udp::UdpSocketState,
         /// The addr we are binding to.
         addr: SocketAddr,
+        /// Connected sockets for busy peers, sharing this socket's port (see
+        /// [`peers`]). Dropped with the socket on rebind.
+        #[cfg(target_vendor = "apple")]
+        peers: peers::PeerSockets,
     },
     Closed {
         /// The addr to rebind to when recovering.
@@ -800,11 +808,7 @@ enum SocketState {
 impl SocketState {
     fn try_get_connected(&self) -> io::Result<(&tokio::net::UdpSocket, &noq_udp::UdpSocketState)> {
         match self {
-            Self::Connected {
-                socket,
-                state,
-                addr: _,
-            } => Ok((socket, state)),
+            Self::Connected { socket, state, .. } => Ok((socket, state)),
             Self::Closed { .. } => {
                 warn!("socket closed");
                 Err(io::Error::new(io::ErrorKind::BrokenPipe, "socket closed"))
@@ -837,6 +841,11 @@ impl SocketState {
             socket.set_only_v6(true)?;
         }
 
+        // Lets the connected per-peer sockets (see [`peers`]) bind to the
+        // same address and port; they set it too.
+        #[cfg(target_vendor = "apple")]
+        socket.set_reuse_port(true)?;
+
         // Binding must happen before calling noq, otherwise `local_addr`
         // is not yet available on all OSes.
         socket.bind(&addr.into())?;
@@ -865,7 +874,47 @@ impl SocketState {
             socket,
             state: socket_state,
             addr: local_addr,
+            #[cfg(target_vendor = "apple")]
+            peers: peers::PeerSockets::new(local_addr),
         })
+    }
+
+    /// Sends `transmit` on the main socket, or on Apple on the destination's
+    /// connected peer socket when it has one (see [`peers`]). Readiness is
+    /// the main socket's: a peer send that would block falls back to it.
+    fn send_transmit(&self, transmit: &Transmit<'_>) -> io::Result<()> {
+        let (socket, state) = self.try_get_connected()?;
+        #[cfg(target_vendor = "apple")]
+        {
+            let Self::Connected { peers, .. } = self else {
+                unreachable!("checked by try_get_connected");
+            };
+            if let Some(res) = peers.send(transmit) {
+                return res;
+            }
+            let res = socket.try_io(Interest::WRITABLE, || state.send(socket.into(), transmit));
+            if res.is_ok() {
+                peers.note_main_send(transmit.destination);
+            }
+            res
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        socket.try_io(Interest::WRITABLE, || state.send(socket.into(), transmit))
+    }
+
+    /// Receives from the connected peer sockets (see [`peers`]); the caller
+    /// polls the main socket first.
+    #[cfg(target_vendor = "apple")]
+    fn poll_recv_peers(
+        &self,
+        cx: &mut Context,
+        bufs: &mut [io::IoSliceMut<'_>],
+        meta: &mut [noq_udp::RecvMeta],
+    ) -> Poll<io::Result<usize>> {
+        match self {
+            Self::Connected { peers, .. } => peers.poll_recv(cx, bufs, meta),
+            Self::Closed { .. } => Poll::Pending,
+        }
     }
 
     fn rebind(&mut self) -> io::Result<()> {
@@ -1033,8 +1082,7 @@ impl UdpSender {
             // If .writable() fails, propagate the error
             result?;
 
-            let (socket, state) = guard.try_get_connected()?;
-            let result = socket.try_io(Interest::WRITABLE, || state.send(socket.into(), transmit));
+            let result = guard.send_transmit(transmit);
 
             match result {
                 // We thought the socket was writable, but it wasn't, then retry so that either another
@@ -1053,10 +1101,7 @@ impl UdpSender {
         self.socket.maybe_rebind()?;
 
         match self.socket.socket.try_read() {
-            Ok(guard) => {
-                let (socket, state) = guard.try_get_connected()?;
-                socket.try_io(Interest::WRITABLE, || state.send(socket.into(), transmit))
-            }
+            Ok(guard) => guard.send_transmit(transmit),
             Err(TryLockError::Poisoned(e)) => panic!("socket lock poisoned: {e}"),
             Err(TryLockError::WouldBlock) => {
                 Err(io::Error::new(io::ErrorKind::WouldBlock, "locked"))
@@ -1083,7 +1128,7 @@ impl Future for SendFutNoq<'_, '_> {
 
             let guard =
                 n0_future::ready!(self.socket.poll_read_socket(&self.socket.send_waker, cx));
-            let (socket, state) = guard.try_get_connected()?;
+            let (socket, _state) = guard.try_get_connected()?;
 
             match socket.poll_send_ready(cx) {
                 Poll::Pending => {
@@ -1091,9 +1136,7 @@ impl Future for SendFutNoq<'_, '_> {
                     return Poll::Pending;
                 }
                 Poll::Ready(Ok(())) => {
-                    let res = socket.try_io(Interest::WRITABLE, || {
-                        state.send(socket.into(), self.transmit)
-                    });
+                    let res = guard.send_transmit(self.transmit);
 
                     if let Err(err) = res {
                         if err.kind() == io::ErrorKind::WouldBlock {
