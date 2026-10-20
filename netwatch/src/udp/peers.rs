@@ -34,6 +34,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use atomic_waker::AtomicWaker;
 use tokio::io::Interest;
 use tracing::{debug, trace, warn};
 
@@ -70,6 +71,11 @@ pub(super) struct PeerSockets {
     /// Recent send counts for destinations without a peer socket: the count
     /// and when it started.
     candidates: Mutex<Vec<(SocketAddr, u32, Instant)>>,
+    /// The receiver last seen in [`poll_recv`](Self::poll_recv), woken when a
+    /// peer socket is added: a receive already pending is registered only on
+    /// the sockets that existed when it polled, and the kernel steers the
+    /// peer's replies to the new one as soon as it exists.
+    recv_waker: AtomicWaker,
 }
 
 impl std::fmt::Debug for PeerSockets {
@@ -89,6 +95,7 @@ impl PeerSockets {
             created: Instant::now(),
             peers: RwLock::new(Vec::new()),
             candidates: Mutex::new(Vec::new()),
+            recv_waker: AtomicWaker::new(),
         }
     }
 
@@ -180,6 +187,8 @@ impl PeerSockets {
         }
         debug!(%dst, local = %self.local, "opened connected peer socket");
         peers.push(peer);
+        drop(peers);
+        self.recv_waker.wake();
     }
 
     fn connect(&self, dst: SocketAddr) -> io::Result<PeerSocket> {
@@ -224,6 +233,7 @@ impl PeerSockets {
         bufs: &mut [io::IoSliceMut<'_>],
         metas: &mut [noq_udp::RecvMeta],
     ) -> Poll<io::Result<usize>> {
+        self.recv_waker.register(cx.waker());
         let peers = self.peers.read().unwrap();
         for peer in peers.iter() {
             if peer.broken.load(Ordering::Relaxed) {
