@@ -19,7 +19,7 @@ use tracing::{debug, trace, warn};
 
 use super::IpFamily;
 
-#[cfg(target_vendor = "apple")]
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
 mod peers;
 
 /// Wrapper around a tokio UDP socket.
@@ -582,7 +582,7 @@ impl UdpSocket {
 
             match socket.poll_recv_ready(cx) {
                 Poll::Pending => {
-                    #[cfg(target_vendor = "apple")]
+                    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
                     if let Poll::Ready(res) = guard.poll_recv_peers(cx, bufs, meta) {
                         return Poll::Ready(res);
                     }
@@ -913,7 +913,7 @@ enum SocketState {
         configure: Option<Configurator>,
         /// Connected sockets for busy peers, sharing this socket's port (see
         /// [`peers`]). Dropped with the socket on rebind.
-        #[cfg(target_vendor = "apple")]
+        #[cfg(any(target_vendor = "apple", target_os = "linux"))]
         peers: peers::PeerSockets,
     },
     Closed {
@@ -977,7 +977,7 @@ impl SocketState {
 
         // Lets the connected per-peer sockets (see [`peers`]) bind to the
         // same address and port; they set it too.
-        #[cfg(target_vendor = "apple")]
+        #[cfg(any(target_vendor = "apple", target_os = "linux"))]
         socket.set_reuse_port(true)?;
 
         // Binding must happen before calling noq, otherwise `local_addr`
@@ -1009,19 +1009,19 @@ impl SocketState {
             state: socket_state,
             addr: local_addr,
             configure,
-            #[cfg(target_vendor = "apple")]
+            #[cfg(any(target_vendor = "apple", target_os = "linux"))]
             peers: peers::PeerSockets::new(local_addr),
         })
     }
 
-    /// Sends `transmit` on the main socket, or on Apple on the destination's
-    /// connected peer socket when it has one (see [`peers`]). Readiness is
+    /// Sends `transmit` on the main socket, or on Apple and Linux on the
+    /// destination's connected peer socket when it has one (see [`peers`]). Readiness is
     /// the main socket's: a peer send that would block falls back to it.
     // TODO: `send` is deprecated, but `try_send` surfaces all I/O errors, which noq treats as fatal.
     #[allow(deprecated)]
     fn send_transmit(&self, transmit: &Transmit<'_>) -> io::Result<()> {
         let (socket, state) = self.try_get_connected()?;
-        #[cfg(target_vendor = "apple")]
+        #[cfg(any(target_vendor = "apple", target_os = "linux"))]
         {
             let Self::Connected { peers, .. } = self else {
                 unreachable!("checked by try_get_connected");
@@ -1035,13 +1035,13 @@ impl SocketState {
             }
             res
         }
-        #[cfg(not(target_vendor = "apple"))]
+        #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
         socket.try_io(Interest::WRITABLE, || state.send(socket.into(), transmit))
     }
 
     /// Receives from the connected peer sockets (see [`peers`]); the caller
     /// polls the main socket first.
-    #[cfg(target_vendor = "apple")]
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
     fn poll_recv_peers(
         &self,
         cx: &mut Context,

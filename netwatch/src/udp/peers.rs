@@ -1,4 +1,7 @@
-//! Connected per-peer sockets beside the main UDP socket, for Apple platforms.
+//! Connected per-peer sockets beside the main UDP socket, for Apple platforms
+//! and Linux.
+//!
+//! # Apple
 //!
 //! XNU's `udp_output` connects and disconnects the protocol control block
 //! around every send that names a destination: a route lookup plus two
@@ -8,6 +11,25 @@
 //! per packet. Batching with `sendmsg_x` does not amortize it; only a socket
 //! `connect(2)`ed to the peer avoids it (a connected send costs ~5 µs, and a
 //! connected receive about half of an unconnected one).
+//!
+//! # Linux
+//!
+//! A multi-queue NIC with XPS (the default: one transmit queue per CPU) picks
+//! the queue of every datagram sent on an unconnected socket from the CPU the
+//! sending thread happens to run on. A QUIC connection's sends move between
+//! runtime worker threads, so consecutive batches leave on different queues
+//! and overtake each other, and on virtio the peer's replies are steered to
+//! whichever receive queue last transmitted, so the other direction reorders
+//! too. An IP tunnel hands that reordering to the inner TCP flow, which takes
+//! it for loss: between two 6-queue virtio VMs it cost about 40% of the
+//! throughput (1.0 against 1.65 Gbit/s). The kernel remembers a socket's
+//! transmit queue only while the socket holds a cached route, which a
+//! `connect(2)`ed UDP socket does and an unconnected one never does
+//! (`__netdev_pick_tx` calls `sk_tx_queue_set` only with `sk_dst_cache`
+//! set). A connected socket therefore keeps a peer's datagrams on one queue,
+//! in order, wherever the sender runs.
+//!
+//! # Mechanism
 //!
 //! The main socket must stay unconnected (it talks to every peer and every
 //! probe target), so a peer that receives sustained traffic gets its own
@@ -46,8 +68,13 @@ use super::{IpFamily, set_recv_buffer_size, set_send_buffer_size};
 const PROMOTE_AFTER: u32 = 64;
 /// Sends older than this no longer count towards promotion.
 const PROMOTE_WINDOW: Duration = Duration::from_secs(1);
-/// Upper bound on connected peer sockets per main socket.
+/// Upper bound on connected peer sockets per main socket. Larger on Linux,
+/// where the main socket is typically a server's and every busy client
+/// beyond the bound keeps reordering.
+#[cfg(target_vendor = "apple")]
 const MAX_PEERS: usize = 8;
+#[cfg(not(target_vendor = "apple"))]
+const MAX_PEERS: usize = 64;
 /// Destinations tracked towards promotion.
 const MAX_CANDIDATES: usize = 32;
 /// A peer socket with no send for this long is evicted when room is needed.
@@ -106,13 +133,22 @@ impl PeerSockets {
     /// Sends `transmit` on the connected socket for its destination, if one
     /// exists. `None` means the caller sends on the main socket. A send the
     /// kernel would block on falls back the same way rather than waiting: UDP
-    /// sends on Apple fail with `ENOBUFS` instead of blocking, so this is
-    /// rare, and the main socket's readiness is what the caller polls.
+    /// sends on Apple fail with `ENOBUFS` instead of blocking and Linux's
+    /// forced 7 MiB send buffer rarely fills, so this is rare, and the main
+    /// socket's readiness is what the caller polls.
     pub(super) fn send(&self, transmit: &noq_udp::Transmit<'_>) -> Option<io::Result<()>> {
         let peers = self.peers.read().unwrap();
         let peer = peers.iter().find(|p| p.addr == transmit.destination)?;
         peer.last_send.store(self.now_ms(), Ordering::Relaxed);
-        match peer.state.send_connected((&peer.socket).into(), transmit) {
+        #[cfg(target_vendor = "apple")]
+        let res = peer.state.send_connected((&peer.socket).into(), transmit);
+        // Linux accepts a destination on a connected socket, and the batched
+        // (GSO) send path names one.
+        // TODO: `send` is deprecated, but `try_send` surfaces all I/O errors, which noq treats as fatal.
+        #[cfg(not(target_vendor = "apple"))]
+        #[allow(deprecated)]
+        let res = peer.state.send((&peer.socket).into(), transmit);
+        match res {
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => None,
             res => Some(res),
         }
