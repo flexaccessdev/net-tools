@@ -40,11 +40,14 @@
 //! peer sockets must be polled for receive alongside it. From the peer's point
 //! of view nothing changes: the same local port sends and receives.
 //!
-//! A receive returns one socket's batch, and the sockets take turns at it:
-//! the one after the socket that delivered the last batch is asked first, the
-//! main socket included. Asked in a fixed order, a socket that stays readable
-//! (one peer sending faster than the caller reads) would keep every socket
-//! behind it from being read until their buffers overflowed.
+//! A receive returns one socket's batch, and the sockets take turns at it in
+//! one rotation: the main socket, then each peer socket in the order it was
+//! opened, and round again. The one after the socket that delivered the last
+//! batch is asked first and the rest follow in that order, so a socket with
+//! nothing to deliver passes its turn to the next one. Asked in a fixed
+//! order, a socket that stays readable (one peer sending faster than the
+//! caller reads) would keep every socket behind it from being read until
+//! their buffers overflowed.
 //!
 //! Promotion happens after [`PROMOTE_AFTER`] sends to one destination within
 //! [`PROMOTE_WINDOW`], which hole-punch probes and a handshake stay well
@@ -85,6 +88,17 @@ const MAX_PEERS: usize = 64;
 const MAX_CANDIDATES: usize = 32;
 /// A peer socket with no send for this long is evicted when room is needed.
 const IDLE_EVICT: Duration = Duration::from_secs(60);
+
+/// The part of the receive rotation asked of the peer sockets. The main
+/// socket's place is between the two, so one pass asks every socket once.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum RecvTurns {
+    /// From the peer whose turn it is to the last peer.
+    BeforeMain,
+    /// The peers ahead of the one whose turn it is: all of them when the turn
+    /// is the main socket's.
+    AfterMain,
+}
 
 pub(super) struct PeerSocket {
     addr: SocketAddr,
@@ -136,10 +150,10 @@ impl PeerSockets {
         }
     }
 
-    /// Whether the next receive is the main socket's to deliver, rather than
-    /// a peer socket's.
-    pub(super) fn main_recv_turn(&self) -> bool {
-        self.recv_turn.load(Ordering::Relaxed) == 0
+    /// The socket whose turn it is to deliver the next received batch: 0 is
+    /// the main socket, `i + 1` the peer at index `i`.
+    pub(super) fn recv_turn(&self) -> usize {
+        self.recv_turn.load(Ordering::Relaxed)
     }
 
     /// The main socket delivered a batch: the peer sockets go next.
@@ -281,23 +295,32 @@ impl PeerSockets {
         })
     }
 
-    /// Receives from the first peer socket with data, starting at the one
-    /// whose turn it is, and registers `cx` on every one asked that has none.
-    /// The caller polls the main socket, before this when the turn is the
-    /// main socket's and after it otherwise.
+    /// Receives from the first peer socket with data among those `turns`
+    /// names, given that the turn is `turn`'s (see [`Self::recv_turn`]), and
+    /// registers `cx` on every one asked that has none. The caller polls the
+    /// main socket between [`RecvTurns::BeforeMain`] and
+    /// [`RecvTurns::AfterMain`], which together ask every socket once, in
+    /// order from the one whose turn it is.
     pub(super) fn poll_recv(
         &self,
         cx: &mut Context<'_>,
         bufs: &mut [io::IoSliceMut<'_>],
         metas: &mut [noq_udp::RecvMeta],
+        turn: usize,
+        turns: RecvTurns,
     ) -> Poll<io::Result<usize>> {
         self.recv_waker.register(cx.waker());
         let peers = self.peers.read().unwrap();
         let len = peers.len();
-        // The turn may name a peer that has since been evicted: the modulo
-        // below brings it back into range.
-        let first = self.recv_turn.load(Ordering::Relaxed).saturating_sub(1);
-        for index in (0..len).map(|offset| (first + offset) % len) {
+        // The turn may name a peer that has since been evicted.
+        let first = turn.saturating_sub(1).min(len);
+        let asked = match turns {
+            RecvTurns::BeforeMain if turn == 0 => 0..0,
+            RecvTurns::BeforeMain => first..len,
+            RecvTurns::AfterMain if turn == 0 => 0..len,
+            RecvTurns::AfterMain => 0..first,
+        };
+        for index in asked {
             let peer = &peers[index];
             if peer.broken.load(Ordering::Relaxed) {
                 continue;

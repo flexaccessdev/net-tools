@@ -581,19 +581,24 @@ impl UdpSocket {
             let (socket, state) = guard.try_get_connected()?;
 
             // The main socket and the peer sockets take turns at delivering a
-            // batch (see [`peers`]), so the peers are asked either before the
-            // main socket or once it has nothing.
+            // batch, in one rotation (see [`peers`]): the peers from the one
+            // whose turn it is, then the main socket, then the peers ahead of
+            // that one.
             #[cfg(any(target_vendor = "apple", target_os = "linux"))]
-            let main_turn = guard.main_recv_turn();
+            let turn = guard.recv_turn();
             #[cfg(any(target_vendor = "apple", target_os = "linux"))]
-            if !main_turn && let Poll::Ready(res) = guard.poll_recv_peers(cx, bufs, meta) {
+            if let Poll::Ready(res) =
+                guard.poll_recv_peers(cx, bufs, meta, turn, peers::RecvTurns::BeforeMain)
+            {
                 return Poll::Ready(res);
             }
 
             match socket.poll_recv_ready(cx) {
                 Poll::Pending => {
                     #[cfg(any(target_vendor = "apple", target_os = "linux"))]
-                    if main_turn && let Poll::Ready(res) = guard.poll_recv_peers(cx, bufs, meta) {
+                    if let Poll::Ready(res) =
+                        guard.poll_recv_peers(cx, bufs, meta, turn, peers::RecvTurns::AfterMain)
+                    {
                         return Poll::Ready(res);
                     }
                     self.recv_waker.register(cx.waker());
@@ -1051,13 +1056,13 @@ impl SocketState {
         socket.try_io(Interest::WRITABLE, || state.send(socket.into(), transmit))
     }
 
-    /// Whether the next received batch is the main socket's to deliver
-    /// rather than a peer socket's (see [`peers`]).
+    /// The socket whose turn it is to deliver the next received batch: 0 is
+    /// the main socket (see [`peers`]).
     #[cfg(any(target_vendor = "apple", target_os = "linux"))]
-    fn main_recv_turn(&self) -> bool {
+    fn recv_turn(&self) -> usize {
         match self {
-            Self::Connected { peers, .. } => peers.main_recv_turn(),
-            Self::Closed { .. } => true,
+            Self::Connected { peers, .. } => peers.recv_turn(),
+            Self::Closed { .. } => 0,
         }
     }
 
@@ -1069,17 +1074,19 @@ impl SocketState {
         }
     }
 
-    /// Receives from the connected peer sockets (see [`peers`]); the caller
-    /// polls the main socket as well.
+    /// Receives from the connected peer sockets `turns` names (see
+    /// [`peers`]); the caller polls the main socket between the two parts.
     #[cfg(any(target_vendor = "apple", target_os = "linux"))]
     fn poll_recv_peers(
         &self,
         cx: &mut Context,
         bufs: &mut [io::IoSliceMut<'_>],
         meta: &mut [noq_udp::RecvMeta],
+        turn: usize,
+        turns: peers::RecvTurns,
     ) -> Poll<io::Result<usize>> {
         match self {
-            Self::Connected { peers, .. } => peers.poll_recv(cx, bufs, meta),
+            Self::Connected { peers, .. } => peers.poll_recv(cx, bufs, meta, turn, turns),
             Self::Closed { .. } => Poll::Pending,
         }
     }
@@ -1586,15 +1593,13 @@ mod tests {
         Ok(())
     }
 
-    /// Two promoted peers and an unpromoted sender all have datagrams
-    /// waiting. Each receive must come from the next socket in turn, so that
-    /// a socket that stays readable cannot keep the others from being read.
+    /// The order in which a receiver with two promoted peers delivers what is
+    /// waiting on its sockets, one datagram per receive. `queued` is how many
+    /// datagrams each sender has waiting: an unpromoted one (0, on the main
+    /// socket), the peer promoted first (1) and the peer promoted second (2).
     #[cfg(any(target_vendor = "apple", target_os = "linux"))]
-    #[tokio::test]
-    async fn test_recv_takes_turns_between_peer_sockets_and_main() -> TestResult {
+    async fn recv_order(queued: [usize; 3]) -> TestResult<Vec<usize>> {
         use std::time::Duration;
-
-        const PER_SENDER: usize = 6;
 
         let receiver = UdpSocket::bind_local(IpFamily::V4, 0)?;
         let receiver_addr = receiver.local_addr()?;
@@ -1623,10 +1628,10 @@ mod tests {
             }
         }
 
-        // Every sender queues several datagrams before anything is read. Each
-        // is one byte longer than the last, so GRO cannot merge them.
+        // Everything is queued before anything is read. Each datagram is one
+        // byte longer than the last, so GRO cannot merge them.
         for (i, sender) in senders.iter().enumerate() {
-            for n in 0..PER_SENDER {
+            for n in 0..queued[i] {
                 let payload = vec![i as u8; 100 + n];
                 sender.send_to(&payload, receiver_addr).await?;
             }
@@ -1636,7 +1641,7 @@ mod tests {
         // One datagram per receive: the source of each is the socket that
         // delivered it.
         let mut sources = Vec::new();
-        for _ in 0..senders.len() * PER_SENDER {
+        for _ in 0..queued.iter().sum() {
             let mut buf = [0u8; 2048];
             let mut bufs = [io::IoSliceMut::new(&mut buf)];
             let mut meta = [noq_udp::RecvMeta::default()];
@@ -1650,12 +1655,30 @@ mod tests {
             let index = addrs.iter().position(|a| *a == meta[0].addr);
             sources.push(index.expect("datagram from a known sender"));
         }
+        Ok(sources)
+    }
 
-        // The main socket's turn comes first, then each peer in the order it
-        // was promoted, and round again.
-        let expected: Vec<usize> = (0..PER_SENDER).flat_map(|_| [0, 1, 2]).collect();
-        assert_eq!(sources, expected);
+    /// Two promoted peers and an unpromoted sender all have datagrams
+    /// waiting. Each receive must come from the next socket in turn, so that
+    /// a socket that stays readable cannot keep the others from being read:
+    /// the main socket first, then each peer in the order it was promoted,
+    /// and round again.
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    #[tokio::test]
+    async fn test_recv_takes_turns_between_peer_sockets_and_main() -> TestResult {
+        let expected: Vec<usize> = (0..6).flat_map(|_| [0, 1, 2]).collect();
+        assert_eq!(recv_order([6, 6, 6]).await?, expected);
+        Ok(())
+    }
 
+    /// The peer promoted last has nothing waiting. The turn must pass from
+    /// it to the main socket, not wrap round to the first peer: otherwise a
+    /// first peer that stays readable keeps the main socket from being read.
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    #[tokio::test]
+    async fn test_recv_reaches_main_when_the_last_peer_is_idle() -> TestResult {
+        let expected: Vec<usize> = (0..6).flat_map(|_| [0, 1]).collect();
+        assert_eq!(recv_order([6, 6, 0]).await?, expected);
         Ok(())
     }
 }
