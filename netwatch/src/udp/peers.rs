@@ -40,6 +40,12 @@
 //! peer sockets must be polled for receive alongside it. From the peer's point
 //! of view nothing changes: the same local port sends and receives.
 //!
+//! A receive returns one socket's batch, and the sockets take turns at it:
+//! the one after the socket that delivered the last batch is asked first, the
+//! main socket included. Asked in a fixed order, a socket that stays readable
+//! (one peer sending faster than the caller reads) would keep every socket
+//! behind it from being read until their buffers overflowed.
+//!
 //! Promotion happens after [`PROMOTE_AFTER`] sends to one destination within
 //! [`PROMOTE_WINDOW`], which hole-punch probes and a handshake stay well
 //! under; at most [`MAX_PEERS`]
@@ -50,7 +56,7 @@ use std::{
     net::SocketAddr,
     sync::{
         Mutex, RwLock,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     task::{Context, Poll},
     time::{Duration, Instant},
@@ -103,6 +109,9 @@ pub(super) struct PeerSockets {
     /// the sockets that existed when it polled, and the kernel steers the
     /// peer's replies to the new one as soon as it exists.
     recv_waker: AtomicWaker,
+    /// The socket whose turn it is to deliver the next received batch: 0 is
+    /// the main socket, `i + 1` the peer at index `i` (see the module docs).
+    recv_turn: AtomicUsize,
 }
 
 impl std::fmt::Debug for PeerSockets {
@@ -123,7 +132,19 @@ impl PeerSockets {
             peers: RwLock::new(Vec::new()),
             candidates: Mutex::new(Vec::new()),
             recv_waker: AtomicWaker::new(),
+            recv_turn: AtomicUsize::new(0),
         }
+    }
+
+    /// Whether the next receive is the main socket's to deliver, rather than
+    /// a peer socket's.
+    pub(super) fn main_recv_turn(&self) -> bool {
+        self.recv_turn.load(Ordering::Relaxed) == 0
+    }
+
+    /// The main socket delivered a batch: the peer sockets go next.
+    pub(super) fn note_main_recv(&self) {
+        self.recv_turn.store(1, Ordering::Relaxed);
     }
 
     fn now_ms(&self) -> u64 {
@@ -260,9 +281,10 @@ impl PeerSockets {
         })
     }
 
-    /// Receives from the first peer socket with data, registering `cx` on
-    /// every one that has none. The main socket is polled by the caller
-    /// first; steering leaves it little traffic once peers exist.
+    /// Receives from the first peer socket with data, starting at the one
+    /// whose turn it is, and registers `cx` on every one asked that has none.
+    /// The caller polls the main socket, before this when the turn is the
+    /// main socket's and after it otherwise.
     pub(super) fn poll_recv(
         &self,
         cx: &mut Context<'_>,
@@ -271,7 +293,12 @@ impl PeerSockets {
     ) -> Poll<io::Result<usize>> {
         self.recv_waker.register(cx.waker());
         let peers = self.peers.read().unwrap();
-        for peer in peers.iter() {
+        let len = peers.len();
+        // The turn may name a peer that has since been evicted: the modulo
+        // below brings it back into range.
+        let first = self.recv_turn.load(Ordering::Relaxed).saturating_sub(1);
+        for index in (0..len).map(|offset| (first + offset) % len) {
+            let peer = &peers[index];
             if peer.broken.load(Ordering::Relaxed) {
                 continue;
             }
@@ -296,6 +323,9 @@ impl PeerSockets {
                 match res {
                     Ok(count) => {
                         trace!(peer = %peer.addr, count, "UDP recv (connected)");
+                        // The next peer's turn, or the main socket's after the last.
+                        let next = if index + 1 < len { index + 2 } else { 0 };
+                        self.recv_turn.store(next, Ordering::Relaxed);
                         return Poll::Ready(Ok(count));
                     }
                     Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,

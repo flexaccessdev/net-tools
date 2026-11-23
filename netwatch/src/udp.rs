@@ -580,10 +580,20 @@ impl UdpSocket {
             let guard = n0_future::ready!(self.poll_read_socket(&self.recv_waker, cx));
             let (socket, state) = guard.try_get_connected()?;
 
+            // The main socket and the peer sockets take turns at delivering a
+            // batch (see [`peers`]), so the peers are asked either before the
+            // main socket or once it has nothing.
+            #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+            let main_turn = guard.main_recv_turn();
+            #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+            if !main_turn && let Poll::Ready(res) = guard.poll_recv_peers(cx, bufs, meta) {
+                return Poll::Ready(res);
+            }
+
             match socket.poll_recv_ready(cx) {
                 Poll::Pending => {
                     #[cfg(any(target_vendor = "apple", target_os = "linux"))]
-                    if let Poll::Ready(res) = guard.poll_recv_peers(cx, bufs, meta) {
+                    if main_turn && let Poll::Ready(res) = guard.poll_recv_peers(cx, bufs, meta) {
                         return Poll::Ready(res);
                     }
                     self.recv_waker.register(cx.waker());
@@ -612,6 +622,8 @@ impl UdpSocket {
                             "UDP recv"
                         );
                     }
+                    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+                    guard.note_main_recv();
                     return Poll::Ready(Ok(count));
                 }
                 Err(err) => {
@@ -1039,8 +1051,26 @@ impl SocketState {
         socket.try_io(Interest::WRITABLE, || state.send(socket.into(), transmit))
     }
 
+    /// Whether the next received batch is the main socket's to deliver
+    /// rather than a peer socket's (see [`peers`]).
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    fn main_recv_turn(&self) -> bool {
+        match self {
+            Self::Connected { peers, .. } => peers.main_recv_turn(),
+            Self::Closed { .. } => true,
+        }
+    }
+
+    /// The main socket delivered a batch: the peer sockets go next.
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    fn note_main_recv(&self) {
+        if let Self::Connected { peers, .. } = self {
+            peers.note_main_recv();
+        }
+    }
+
     /// Receives from the connected peer sockets (see [`peers`]); the caller
-    /// polls the main socket first.
+    /// polls the main socket as well.
     #[cfg(any(target_vendor = "apple", target_os = "linux"))]
     fn poll_recv_peers(
         &self,
@@ -1552,6 +1582,79 @@ mod tests {
 
         assert_eq!(&buf[..n], b"hello");
         assert_eq!(from, sender_addr);
+
+        Ok(())
+    }
+
+    /// Two promoted peers and an unpromoted sender all have datagrams
+    /// waiting. Each receive must come from the next socket in turn, so that
+    /// a socket that stays readable cannot keep the others from being read.
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    #[tokio::test]
+    async fn test_recv_takes_turns_between_peer_sockets_and_main() -> TestResult {
+        use std::time::Duration;
+
+        const PER_SENDER: usize = 6;
+
+        let receiver = UdpSocket::bind_local(IpFamily::V4, 0)?;
+        let receiver_addr = receiver.local_addr()?;
+        let peer_a = UdpSocket::bind_local(IpFamily::V4, 0)?;
+        let peer_b = UdpSocket::bind_local(IpFamily::V4, 0)?;
+        let stranger = UdpSocket::bind_local(IpFamily::V4, 0)?;
+        let senders = [&stranger, &peer_a, &peer_b];
+        let addrs = [
+            stranger.local_addr()?,
+            peer_a.local_addr()?,
+            peer_b.local_addr()?,
+        ];
+
+        // Enough sends to each peer to promote it to a connected socket; the
+        // stranger gets none and stays on the main socket.
+        for dst in &addrs[1..] {
+            let transmit = Transmit {
+                destination: *dst,
+                ecn: None,
+                contents: b"promote",
+                segment_size: None,
+                src_ip: None,
+            };
+            for _ in 0..100 {
+                std::future::poll_fn(|cx| receiver.poll_send_noq(cx, &transmit)).await?;
+            }
+        }
+
+        // Every sender queues several datagrams before anything is read. Each
+        // is one byte longer than the last, so GRO cannot merge them.
+        for (i, sender) in senders.iter().enumerate() {
+            for n in 0..PER_SENDER {
+                let payload = vec![i as u8; 100 + n];
+                sender.send_to(&payload, receiver_addr).await?;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // One datagram per receive: the source of each is the socket that
+        // delivered it.
+        let mut sources = Vec::new();
+        for _ in 0..senders.len() * PER_SENDER {
+            let mut buf = [0u8; 2048];
+            let mut bufs = [io::IoSliceMut::new(&mut buf)];
+            let mut meta = [noq_udp::RecvMeta::default()];
+            let count = tokio::time::timeout(
+                Duration::from_secs(5),
+                std::future::poll_fn(|cx| receiver.poll_recv_noq(cx, &mut bufs, &mut meta)),
+            )
+            .await
+            .expect("recv must not hang")?;
+            assert_eq!(count, 1);
+            let index = addrs.iter().position(|a| *a == meta[0].addr);
+            sources.push(index.expect("datagram from a known sender"));
+        }
+
+        // The main socket's turn comes first, then each peer in the order it
+        // was promoted, and round again.
+        let expected: Vec<usize> = (0..PER_SENDER).flat_map(|_| [0, 1, 2]).collect();
+        assert_eq!(sources, expected);
 
         Ok(())
     }
